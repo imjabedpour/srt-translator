@@ -1,35 +1,30 @@
-import os
-import threading
-import re
+import os, threading, re
 from flask import Flask, request, jsonify, render_template, send_file
-from dotenv import load_dotenv
 from openai import OpenAI
-
-load_dotenv()
 
 app = Flask(__name__)
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# OpenRouter configuration
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ.get("OPENAI_API_KEY")  # Use OpenRouter key here
+)
 
 progress = {"value": 0, "total": 0}
 output_path = "translated.srt"
-
 
 def parse_srt(content):
     pattern = r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\n([\s\S]*?)(?=\n\n|\Z)'
     return re.findall(pattern, content.strip())
 
-
 def translate_text(text):
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="meta-llama/llama-3.1-8b-instruct:free",
         messages=[
-            {"role": "system", "content": "You are a translator. Translate subtitle text to Persian accurately. Return only the translation, no explanation."},
-            {"role": "user", "content": text.strip()}
+            {"role": "user", "content": f"Translate the following subtitle text to Persian. Return only the translation, no explanation:\n{text}"}
         ]
     )
     return response.choices[0].message.content.strip()
-
 
 def do_translation(blocks, srt_path):
     global progress
@@ -43,11 +38,9 @@ def do_translation(blocks, srt_path):
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(result))
 
-
 @app.route("/")
 def index():
     return render_template("index.html")
-
 
 @app.route("/translate", methods=["POST"])
 def translate():
@@ -59,16 +52,13 @@ def translate():
     threading.Thread(target=do_translation, args=(blocks, output_path)).start()
     return jsonify({"status": "started", "total": len(blocks)})
 
-
 @app.route("/progress")
 def get_progress():
     return jsonify(progress)
 
-
 @app.route("/download")
 def download():
     return send_file(output_path, as_attachment=True)
-
 
 if __name__ == "__main__":
     app.run(debug=True)

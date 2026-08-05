@@ -1,7 +1,4 @@
 flask
-
 python-dotenv
-
-google-genai
-
+openai
 gunicorn

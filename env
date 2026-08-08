@@ -1,0 +1,8 @@
+# Get this from https://aistudio.google.com/apikey
+GEMINI_API_KEY=AQ.Ab8RN6L-9FWR0sSfkibuaLOGB-KrLjHuWedBOLRLPxeBcEwejg
+
+# Optional overrides (defaults shown)
+# GEMINI_MODEL=gemini-2.5-flash-lite
+# BATCH_SIZE=15
+# SECONDS_BETWEEN_REQUESTS=4.5
+# MAX_UPLOAD_MB=5

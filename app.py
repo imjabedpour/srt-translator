@@ -65,8 +65,14 @@ def call_gemini(prompt, max_retries=3):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
+    # Send the key as a header rather than a ?key= query param. This matches
+    # what Google's official SDKs do, and is the reliable method for the
+    # newer "Auth key" (AQ.) format that Google is rolling out — the query
+    # param path has been reported to 404/401 for some AQ keys.
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3},
@@ -75,7 +81,7 @@ def call_gemini(prompt, max_retries=3):
     delay = 3
     for attempt in range(max_retries):
         try:
-            resp = requests.post(GEMINI_URL, headers=headers, params=params, json=body, timeout=60)
+            resp = requests.post(GEMINI_URL, headers=headers, json=body, timeout=60)
             if resp.status_code == 429:
                 raise RuntimeError("Rate limited by Gemini API (429)")
             resp.raise_for_status()

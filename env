@@ -1,0 +1,8 @@
+# Get this from https://openrouter.ai/keys
+OPENROUTER_API_KEY=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
+
+# Optional overrides (defaults shown)
+# OPENROUTER_MODEL=deepseek/deepseek-chat-v3-0324:free
+# BATCH_SIZE=15
+# SECONDS_BETWEEN_REQUESTS=3.5
+# MAX_UPLOAD_MB=5

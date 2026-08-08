@@ -1,66 +1,163 @@
 import os
 import re
-import threading
 import time
-from flask import Flask, request, jsonify, render_template, send_file
-from google import genai
+import threading
+import requests
 from dotenv import load_dotenv
-
 load_dotenv()
+
+from flask import Flask, request, jsonify, render_template, send_file
 
 app = Flask(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set in environment variables")
+# ---- Config ----
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+# Free-tier model on OpenRouter. The exact list of ":free" models rotates,
+# so this is overridable via env var without touching the code.
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324:free")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# How many subtitle blocks to translate per API call. Bigger batches = fewer
+# requests = less likely to hit the free tier's daily request cap, but too
+# big risks the model losing track / truncating. 15-20 is a safe range.
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "15"))
 
-progress = {"value": 0, "total": 0, "status": "idle", "error": None}
-output_path = "translated.srt"
+# Free tier is roughly 20 requests/minute -> stay safely under that.
+SECONDS_BETWEEN_REQUESTS = float(os.environ.get("SECONDS_BETWEEN_REQUESTS", "3.5"))
+
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "5"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "translated.srt")
+
+progress = {
+    "value": 0,
+    "total": 0,
+    "status": "idle",   # idle | running | done | error
+    "error": None,
+}
+progress_lock = threading.Lock()
 
 
 def parse_srt(content):
-    pattern = r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\n([\s\S]*?)(?=\n\n|\Z)'
+    """Parse SRT content into (number, timing, text) tuples.
+    Normalizes Windows-style line endings first, since most SRT files
+    are CRLF and the naive regex would otherwise misparse or leave
+    stray \\r characters in the text.
+    """
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    pattern = r"(\d+)\n(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\n([\s\S]*?)(?=\n\n|\Z)"
     return re.findall(pattern, content.strip())
 
 
-def translate_text(text, retries=3):
-    last_error = None
-    for attempt in range(retries):
+def decode_srt_bytes(raw_bytes):
+    """Try a handful of encodings commonly seen in SRT files in the wild."""
+    for enc in ("utf-8-sig", "utf-8", "cp1256", "latin-1"):
         try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=(
-                    "Translate the following subtitle text to Persian. "
-                    "Return only the translation, no explanation:\n" + text
-                )
-            )
-            return response.text.strip()
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # Last resort: decode with replacement so we never hard-crash on this.
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def call_openrouter(prompt, max_retries=3):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        # Optional but recommended by OpenRouter for free-tier routing/analytics.
+        "HTTP-Referer": os.environ.get("APP_URL", "https://localhost"),
+        "X-Title": "SRT Persian Translator",
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+    }
+
+    delay = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=headers, json=body, timeout=60)
+            if resp.status_code == 429:
+                raise RuntimeError("Rate limited by OpenRouter (429)")
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            last_error = e
-            time.sleep(2 * (attempt + 1))  # backoff قبل از تلاش بعدی
-    raise RuntimeError(f"Translation failed after {retries} attempts: {last_error}")
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(delay)
+            delay *= 2
 
 
-def do_translation(blocks, srt_path):
-    global progress
-    progress["total"] = len(blocks)
-    progress["value"] = 0
-    progress["status"] = "running"
-    progress["error"] = None
+def translate_batch(blocks_batch):
+    """Translate a batch of (num, timing, text) tuples in ONE API call.
+    Uses [[n]] markers so we can reliably split the model's reply back
+    into per-block translations, even if the model adds extra spacing.
+    """
+    numbered_input = "\n".join(
+        f"[[{i}]]\n{text.strip()}" for i, (_, _, text) in enumerate(blocks_batch)
+    )
+    prompt = (
+        "You are translating movie/TV subtitle lines from English to Persian (Farsi). "
+        "Keep the tone natural and conversational, and preserve meaning precisely, "
+        "including nuance in philosophical or emotional dialogue. "
+        "Below are numbered subtitle blocks marked like [[0]], [[1]], etc. "
+        "Translate each block's text to Persian. "
+        "Return ONLY the same [[n]] markers followed by the Persian translation, "
+        "one per block, in the same order, with nothing else added "
+        "(no explanations, no extra commentary):\n\n"
+        f"{numbered_input}"
+    )
+
+    reply = call_openrouter(prompt)
+
+    matches = dict(
+        (int(m.group(1)), m.group(2).strip())
+        for m in re.finditer(r"\[\[(\d+)\]\]\s*\n?(.*?)(?=\n?\[\[\d+\]\]|\Z)", reply, re.DOTALL)
+    )
+
+    translations = []
+    for i, (_, _, text) in enumerate(blocks_batch):
+        translations.append(matches.get(i, text.strip()))  # fallback: keep original if missing
+    return translations
+
+
+def do_translation(blocks):
+    with progress_lock:
+        progress["total"] = len(blocks)
+        progress["value"] = 0
+        progress["status"] = "running"
+        progress["error"] = None
+
     result = []
     try:
-        for i, (num, timing, text) in enumerate(blocks):
-            translated = translate_text(text.strip())
-            result.append(f"{num}\n{timing}\n{translated}\n")
-            progress["value"] = i + 1
-        with open(srt_path, "w", encoding="utf-8") as f:
+        for start in range(0, len(blocks), BATCH_SIZE):
+            batch = blocks[start:start + BATCH_SIZE]
+            translated_texts = translate_batch(batch)
+
+            for (num, timing, _), translated in zip(batch, translated_texts):
+                result.append(f"{num}\n{timing}\n{translated}\n")
+
+            with progress_lock:
+                progress["value"] = min(start + len(batch), len(blocks))
+
+            time.sleep(SECONDS_BETWEEN_REQUESTS)
+
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(result))
-        progress["status"] = "done"
+
+        with progress_lock:
+            progress["status"] = "done"
+
     except Exception as e:
-        progress["status"] = "error"
-        progress["error"] = str(e)
+        with progress_lock:
+            progress["status"] = "error"
+            progress["error"] = str(e)
 
 
 @app.route("/")
@@ -70,33 +167,44 @@ def index():
 
 @app.route("/translate", methods=["POST"])
 def translate():
+    with progress_lock:
+        if progress["status"] == "running":
+            return jsonify({"error": "ترجمه‌ی دیگری در حال اجراست، صبر کنید تا تمام شود"}), 409
+
     file = request.files.get("file")
-    if not file:
-        return jsonify({"error": "No file uploaded"}), 400
+    if not file or file.filename == "":
+        return jsonify({"error": "فایلی انتخاب نشده"}), 400
+    if not file.filename.lower().endswith(".srt"):
+        return jsonify({"error": "فقط فایل با پسوند .srt پذیرفته می‌شود"}), 400
 
-    try:
-        content = file.read().decode("utf-8")
-    except UnicodeDecodeError:
-        return jsonify({"error": "File encoding must be UTF-8"}), 400
-
+    content = decode_srt_bytes(file.read())
     blocks = parse_srt(content)
     if not blocks:
-        return jsonify({"error": "No valid SRT blocks found"}), 400
+        return jsonify({"error": "فایل SRT معتبر نیست یا خالی است"}), 400
 
-    threading.Thread(target=do_translation, args=(blocks, output_path), daemon=True).start()
+    # Remove any previous output so a failed/old run can't be downloaded by mistake.
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    threading.Thread(target=do_translation, args=(blocks,), daemon=True).start()
     return jsonify({"status": "started", "total": len(blocks)})
 
 
 @app.route("/progress")
 def get_progress():
-    return jsonify(progress)
+    with progress_lock:
+        return jsonify(dict(progress))
 
 
 @app.route("/download")
 def download():
-    if progress["status"] != "done":
-        return jsonify({"error": "Translation not finished yet"}), 400
-    return send_file(output_path, as_attachment=True)
+    with progress_lock:
+        status = progress["status"]
+    if status != "done":
+        return jsonify({"error": "ترجمه هنوز آماده نیست"}), 409
+    if not os.path.exists(output_path):
+        return jsonify({"error": "فایلی برای دانلود موجود نیست"}), 404
+    return send_file(output_path, as_attachment=True, download_name="translated_fa.srt")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
-# Get this from https://openrouter.ai/keys
-OPENROUTER_API_KEY=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
+# Get this from https://aistudio.google.com/apikey
+GEMINI_API_KEY=AQ.Ab8RN6KNvGzTaKjdZ09E6PhTOD8v92NdIR67ZDwIn5kHAnB4dA
 
 # Optional overrides (defaults shown)
-# OPENROUTER_MODEL=deepseek/deepseek-chat-v3-0324:free
+# GEMINI_MODEL=gemini-2.5-flash-lite
 # BATCH_SIZE=15
-# SECONDS_BETWEEN_REQUESTS=3.5
+# SECONDS_BETWEEN_REQUESTS=4.5
 # MAX_UPLOAD_MB=5

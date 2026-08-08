@@ -11,19 +11,19 @@ from flask import Flask, request, jsonify, render_template, send_file
 app = Flask(__name__)
 
 # ---- Config ----
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-# Free-tier model on OpenRouter. The exact list of ":free" models rotates,
-# so this is overridable via env var without touching the code.
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324:free")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Free-tier friendly model. Overridable via env var without touching code,
+# since Google's free-tier model lineup/limits change over time.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # How many subtitle blocks to translate per API call. Bigger batches = fewer
 # requests = less likely to hit the free tier's daily request cap, but too
 # big risks the model losing track / truncating. 15-20 is a safe range.
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "15"))
 
-# Free tier is roughly 20 requests/minute -> stay safely under that.
-SECONDS_BETWEEN_REQUESTS = float(os.environ.get("SECONDS_BETWEEN_REQUESTS", "3.5"))
+# Free tier for flash-lite is roughly 15 requests/minute -> stay safely under.
+SECONDS_BETWEEN_REQUESTS = float(os.environ.get("SECONDS_BETWEEN_REQUESTS", "4.5"))
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "5"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -61,32 +61,26 @@ def decode_srt_bytes(raw_bytes):
     return raw_bytes.decode("utf-8", errors="replace")
 
 
-def call_openrouter(prompt, max_retries=3):
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not set")
+def call_gemini(prompt, max_retries=3):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        # Optional but recommended by OpenRouter for free-tier routing/analytics.
-        "HTTP-Referer": os.environ.get("APP_URL", "https://localhost"),
-        "X-Title": "SRT Persian Translator",
-    }
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
     body = {
-        "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3},
     }
 
     delay = 3
     for attempt in range(max_retries):
         try:
-            resp = requests.post(OPENROUTER_URL, headers=headers, json=body, timeout=60)
+            resp = requests.post(GEMINI_URL, headers=headers, params=params, json=body, timeout=60)
             if resp.status_code == 429:
-                raise RuntimeError("Rate limited by OpenRouter (429)")
+                raise RuntimeError("Rate limited by Gemini API (429)")
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except Exception as e:
             if attempt == max_retries - 1:
                 raise e
@@ -114,7 +108,7 @@ def translate_batch(blocks_batch):
         f"{numbered_input}"
     )
 
-    reply = call_openrouter(prompt)
+    reply = call_gemini(prompt)
 
     matches = dict(
         (int(m.group(1)), m.group(2).strip())
